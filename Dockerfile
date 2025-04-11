@@ -6,8 +6,7 @@ ENV PYTORCH_ROCM_ARCH=${PYTORCH_ROCM_ARCH}
 ARG PYTHON_VERSION=3.12
 ARG HIPBLASLT_BRANCH="4d40e36"
 ARG HIPBLAS_COMMON_BRANCH="7c1566b"
-ARG LEGACY_HIPBLASLT_OPTION=
-ARG PYTORCH_BRANCH="3a585126"
+ARG PYTORCH_BRANCH="3ac5a49"
 ARG PYTORCH_VISION_BRANCH="v0.19.1"
 ARG PYTORCH_REPO="https://github.com/pytorch/pytorch.git"
 ARG PYTORCH_VISION_REPO="https://github.com/pytorch/vision.git"
@@ -36,7 +35,7 @@ RUN apt-get update -y \
     && python3 --version && python3 -m pip --version \
     && pip install uv \
     && pip install -U packaging cmake ninja wheel setuptools pybind11 Cython \
-    && apt-get update && apt-get install -y git && apt-get install -y cmake  && apt-get install -y python3.10-venv \
+    && apt-get update && apt-get install -y git && apt-get install -y wget && apt-get install -y cmake  && apt-get install -y python3.10-venv \
     && apt-get update && apt-get install -y openmpi-bin libopenmpi-dev
 
 RUN mkdir -p /app/install
@@ -50,10 +49,17 @@ RUN git clone https://github.com/ROCm/hipBLAS-common.git \
     && make package \
     && dpkg -i ./*.deb
 
+
+# Install CMake 3.26.2 temporarily
+RUN mkdir -p /opt/cmake && \
+    wget -O - https://github.com/Kitware/CMake/releases/download/v3.26.2/cmake-3.26.2-linux-x86_64.tar.gz | \
+    tar -xvzf - --strip-components=1 -C /opt/cmake && \
+    ln -sf /opt/cmake/bin/cmake /usr/local/bin/cmake
+
 RUN git clone https://github.com/ROCm/hipBLASLt \
     && cd hipBLASLt \
     && git checkout ${HIPBLASLT_BRANCH} \
-    && ./install.sh -d --architecture ${PYTORCH_ROCM_ARCH} ${LEGACY_HIPBLASLT_OPTION} \
+    && ./install.sh -d --architecture ${PYTORCH_ROCM_ARCH} \
     && cd build/release \
     && make package -j${MAX_JOBS} \
     && echo "Searching for build and .deb files:" \
@@ -61,6 +67,11 @@ RUN git clone https://github.com/ROCm/hipBLASLt \
     && find . -name "*.deb"
 
 RUN cp /app/hipBLASLt/build/release/*.deb /app/hipBLAS-common/build/*.deb /app/install
+
+# Uninstall CMake
+RUN rm -rf /opt/cmake && rm -f /usr/local/bin/cmake
+# Reinstall latest Cmake
+RUN apt-get update && apt-get install -y cmake
 
 RUN git clone ${TRITON_REPO}
 RUN cd triton \
@@ -70,13 +81,24 @@ RUN cd triton \
     pip install dist/*.whl
 RUN cp /app/triton/python/dist/*.whl /app/install
 
-# Remove existing openmpi 
-RUN apt-get remove --purge -y openmpi-bin libopenmpi-dev
+# Set working directory
+WORKDIR /pytorch
 
-# Set environment variables
 ENV ROCM_PATH=/opt/rocm
+ENV PATH=$ROCM_PATH/bin:$ROCM_PATH/hip/bin:$PATH
+ENV LD_LIBRARY_PATH=$ROCM_PATH/lib:$LD_LIBRARY_PATH
+ENV USE_ROCM=1
+ENV USE_MPI=1
+# Set environment variables
+ENV MPI_HOME=/opt/ompi-rocm
+ENV PATH=$MPI_HOME/bin:$PATH
+ENV LD_LIBRARY_PATH=$MPI_HOME/lib:$LD_LIBRARY_PATH
+ENV CMAKE_PREFIX_PATH=$MPI_HOME:$CMAKE_PREFIX_PATH
+ENV MPI_INCLUDE_DIR=$MPI_HOME/include
+ENV MPI_LIBRARY=$MPI_HOME/lib/libmpi.so
 
 # Clone and build UCX
+RUN apt-get update && apt-get install -y autoconf
 RUN git clone https://github.com/openucx/ucx.git -b v1.15.x && \
     cd ucx && \
     ./autogen.sh && \
@@ -95,22 +117,13 @@ RUN cd / && \
       --with-rocm=$ROCM_PATH && \
     make -j$(nproc) && make install
 
-ENV PATH="/opt/ompi-rocm/bin:${PATH}"
+# Set OpenMPI env variables
+ENV OMPI_MCA_pml=ucx
+ENV OMPI_MCA_osc=ucx
+ENV OMPI_MCA_coll_ucc_enable=1
+ENV OMPI_MCA_coll_ucc_priority=100
+ENV UCX_TLS=sm,self,rocm
 
-ENV MPI_HOME=/opt/ompi-rocm
-ENV PATH=$MPI_HOME/bin:$PATH
-ENV LD_LIBRARY_PATH=$MPI_HOME/lib:$LD_LIBRARY_PATH
-ENV CMAKE_PREFIX_PATH=$MPI_HOME:$CMAKE_PREFIX_PATH
-ENV ROCM_PATH=/opt/rocm
-ENV PATH=$ROCM_PATH/bin:$ROCM_PATH/hip/bin:$PATH
-ENV LD_LIBRARY_PATH=$ROCM_PATH/lib:$LD_LIBRARY_PATH
-ENV USE_ROCM=1
-ENV USE_MPI=1
-ENV MPI_INCLUDE_DIR=$MPI_HOME/include
-ENV MPI_LIBRARY=$MPI_HOME/lib/libmpi.so
-
-# Set working directory
-WORKDIR /pytorch
 
 # Clone and build PyTorch
 RUN git clone ${PYTORCH_REPO} pytorch && \
@@ -119,7 +132,7 @@ RUN git clone ${PYTORCH_REPO} pytorch && \
     pip install -r requirements.txt && \
     git submodule update --init --recursive && \
     python3 tools/amd_build/build_amd.py && \
-    CMAKE_PREFIX_PATH=$(python3 -c 'import sys; print(sys.prefix)') python3 setup.py bdist_wheel --dist-dir=dist && \
+    python3 setup.py bdist_wheel --dist-dir=dist && \
     pip install dist/*.whl
 
 # Clone and build torchvision
@@ -153,13 +166,5 @@ RUN python -m venv /app/venv
 ENV PATH="/app/venv/bin:$PATH"
 
 RUN pip install /app/install/*.whl
-
-# Set OpenMPI env variables
-ENV OMPI_MCA_pml=ucx
-ENV OMPI_MCA_osc=ucx
-ENV OMPI_MCA_coll_ucc_enable=1
-ENV OMPI_MCA_coll_ucc_priority=100
-ENV UCX_TLS=sm,self,rocm
-
 
 ###############################################################################
