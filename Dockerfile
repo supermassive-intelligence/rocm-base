@@ -15,7 +15,7 @@ ARG FA_REPO="https://github.com/ROCm/flash-attention.git"
 
 ARG TRITON_BRANCH="e5be006"
 ARG TRITON_REPO="https://github.com/triton-lang/triton.git"
-ARG MAX_JOBS=16
+ARG MAX_JOBS=$(nproc)
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN mkdir -p /app
@@ -36,7 +36,7 @@ RUN apt-get update -y \
     && pip install uv \
     && pip install -U packaging cmake ninja wheel setuptools pybind11 Cython \
     && apt-get update && apt-get install -y git && apt-get install -y wget && apt-get install -y cmake  && apt-get install -y python3.10-venv \
-    && apt-get update && apt-get install -y openmpi-bin libopenmpi-dev
+    && apt-get update && apt-get install -y openmpi-bin libopenmpi-dev 
 
 RUN mkdir -p /app/install
 
@@ -107,16 +107,45 @@ RUN git clone https://github.com/openucx/ucx.git -b v1.15.x && \
       --enable-mt && \
     make -j$(nproc) && make install
 
+# Download and build Slurm with system PMIx support
+RUN apt-get update && apt-get install -y libpam0g-dev libnuma-dev libhwloc-dev libpmix-dev libpmix2 libmunge-dev munge
+ARG SLURM_VERSION=23.11.1
+RUN wget https://download.schedmd.com/slurm/slurm-${SLURM_VERSION}.tar.bz2 && \
+    tar -xjf slurm-${SLURM_VERSION}.tar.bz2 && \
+    cd slurm-${SLURM_VERSION} && \
+    PKG_CONFIG_PATH="/usr/lib/x86_64-linux-gnu/pkgconfig" \
+    CPPFLAGS="-I/usr/lib/x86_64-linux-gnu/pmix2/include" \
+    LDFLAGS="-L/lib/x86_64-linux-gnu" \
+    ./configure \
+        --prefix=/usr/local \
+        --sysconfdir=/etc/slurm \
+        --with-pmix \
+        --enable-pam \
+        --with-pam_dir=/lib/x86_64-linux-gnu/security && \
+    make -j$(nproc) && \
+    make install && \
+    mkdir -p /var/log/slurm && \
+    mkdir -p /var/spool/slurmd && \
+    chown slurm:slurm /var/spool/slurmd 2>/dev/null || true && \
+    ldconfig
+
 # Build ROCM-Aware Open MPI
 RUN cd / && \
-    wget https://download.open-mpi.org/release/open-mpi/v5.0/openmpi-5.0.7.tar.gz && \
-    tar -xvf openmpi-5.0.7.tar.gz && \
-    cd openmpi-5.0.7 && \
-    ./configure --prefix=/opt/ompi-rocm \
-      --with-ucx=/opt/ucx-rocm \
-      --with-rocm=$ROCM_PATH && \
-    make -j$(nproc) && make install
+      wget https://download.open-mpi.org/release/open-mpi/v5.0/openmpi-5.0.7.tar.gz && \
+      tar -xvf openmpi-5.0.7.tar.gz && \
+      cd openmpi-5.0.7 && \
+      ./configure --prefix=/opt/ompi-rocm \
+        --with-ucx=/opt/ucx-rocm \
+        --with-rocm=$ROCM_PATH \
+        --with-slurm \
+	--with-pmix-libdir=/lib/x86_64-linux-gnu \
+	--with-pmix-headers=/usr/lib/x86_64-linux-gnu/pmix2/include \
+        --enable-orterun-prefix-by-default && \
+      make -j$(nproc) && make install
 
+# Verify Slurm support was built
+RUN [ ! -z "$(/opt/ompi-rocm/bin/ompi_info | grep -i slurm)" ] 
+ 
 # Set OpenMPI env variables
 ENV OMPI_MCA_pml=ucx
 ENV OMPI_MCA_osc=ucx
@@ -167,4 +196,4 @@ ENV PATH="/app/venv/bin:$PATH"
 
 RUN pip install /app/install/*.whl
 
-###############################################################################
+#############################################################################
