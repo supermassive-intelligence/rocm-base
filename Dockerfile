@@ -1,17 +1,22 @@
 ###############################################################################
 # AMD BASE IMAGE
-FROM rocm/dev-ubuntu-22.04:6.3.1-complete AS amd
+FROM rocm/dev-ubuntu-22.04:6.4.1-complete AS amd
 ARG PYTORCH_ROCM_ARCH=gfx90a;gfx942
 ENV PYTORCH_ROCM_ARCH=${PYTORCH_ROCM_ARCH}
 ARG PYTHON_VERSION=3.12
-ARG HIPBLASLT_BRANCH="4d40e36"
+ARG HIPBLASLT_BRANCH="aa0bda7b"
 ARG HIPBLAS_COMMON_BRANCH="7c1566b"
-ARG PYTORCH_BRANCH="3ac5a49"
-ARG PYTORCH_VISION_BRANCH="v0.19.1"
+ARG PYTORCH_BRANCH="f717b2af"
+ARG PYTORCH_VISION_BRANCH="v0.21.0"
 ARG PYTORCH_REPO="https://github.com/pytorch/pytorch.git"
 ARG PYTORCH_VISION_REPO="https://github.com/pytorch/vision.git"
-ARG FA_BRANCH="b7d29fb"
+ARG FA_BRANCH="1a7f4dfa"
 ARG FA_REPO="https://github.com/ROCm/flash-attention.git"
+ARG AITER_BRANCH="6b92d30d"
+ARG AITER_REPO="https://github.com/ROCm/aiter.git"
+
+ARG SLURM_VERSION=23.11.1
+ARG PMIX_VERSION=5.0.8
 
 ARG TRITON_BRANCH="e5be006"
 ARG TRITON_REPO="https://github.com/triton-lang/triton.git"
@@ -36,7 +41,7 @@ RUN apt-get update -y \
     && pip install uv \
     && pip install -U packaging cmake ninja wheel setuptools pybind11 Cython \
     && apt-get update && apt-get install -y git && apt-get install -y wget && apt-get install -y cmake  && apt-get install -y python3.10-venv \
-    && apt-get update && apt-get install -y openmpi-bin libopenmpi-dev 
+    && apt-get update && apt-get install -y openmpi-bin libopenmpi-dev
 
 RUN mkdir -p /app/install
 
@@ -81,6 +86,11 @@ RUN cd triton \
     pip install dist/*.whl
 RUN cp /app/triton/python/dist/*.whl /app/install
 
+FROM base AS build_amdsmi
+RUN cd /opt/rocm/share/amd_smi \
+    && pip wheel . --wheel-dir=dist
+RUN mkdir -p /app/install && cp /opt/rocm/share/amd_smi/dist/*.whl /app/install
+
 # Set working directory
 WORKDIR /pytorch
 
@@ -107,15 +117,29 @@ RUN git clone https://github.com/openucx/ucx.git -b v1.15.x && \
       --enable-mt && \
     make -j$(nproc) && make install
 
+# Download and build PMIx
+ENV PMIX_DIR=/opt/pmix
+RUN wget https://github.com/openpmix/openpmix/releases/download/v${PMIX_VERSION}/pmix-${PMIX_VERSION}.tar.gz && \
+    tar -xzf pmix-${PMIX_VERSION}.tar.gz && \
+    cd pmix-${PMIX_VERSION} && \
+    ./configure --prefix=${PMIX_DIR} \
+                --enable-shared \
+                --disable-static && \
+    make -j$(nproc) && \
+    make install
+
+ENV PATH="${PMIX_DIR}/bin:${PATH}"
+ENV LD_LIBRARY_PATH="${PMIX_DIR}/lib:${LD_LIBRARY_PATH}"
+ENV PKG_CONFIG_PATH="${PMIX_DIR}/lib/pkgconfig:${PKG_CONFIG_PATH}"
+
 # Download and build Slurm with system PMIx support
-RUN apt-get update && apt-get install -y libpam0g-dev libnuma-dev libhwloc-dev libpmix-dev libpmix2 libmunge-dev munge
-ARG SLURM_VERSION=23.11.1
+RUN apt-get update && apt-get install -y libpam0g-dev libnuma-dev libhwloc-dev libmunge-dev munge
 RUN wget https://download.schedmd.com/slurm/slurm-${SLURM_VERSION}.tar.bz2 && \
     tar -xjf slurm-${SLURM_VERSION}.tar.bz2 && \
     cd slurm-${SLURM_VERSION} && \
-    PKG_CONFIG_PATH="/usr/lib/x86_64-linux-gnu/pkgconfig" \
-    CPPFLAGS="-I/usr/lib/x86_64-linux-gnu/pmix2/include" \
-    LDFLAGS="-L/lib/x86_64-linux-gnu" \
+    PKG_CONFIG_PATH="${PMIX_DIR}/lib/pkgconfig" \
+    CPPFLAGS="-I${PMIX_DIR}/include" \
+    LDFLAGS="-L${PMIX_DIR}/lib" \
     ./configure \
         --prefix=/usr/local \
         --sysconfdir=/etc/slurm \
@@ -138,14 +162,14 @@ RUN cd / && \
         --with-ucx=/opt/ucx-rocm \
         --with-rocm=$ROCM_PATH \
         --with-slurm \
-	--with-pmix-libdir=/lib/x86_64-linux-gnu \
-	--with-pmix-headers=/usr/lib/x86_64-linux-gnu/pmix2/include \
+	--with-pmix-libdir=$PMIX_DIR/lib \
+	--with-pmix-headers=$PMIX_DIR/include \
         --enable-orterun-prefix-by-default && \
       make -j$(nproc) && make install
 
 # Verify Slurm support was built
-RUN [ ! -z "$(/opt/ompi-rocm/bin/ompi_info | grep -i slurm)" ] 
- 
+RUN [ ! -z "$(/opt/ompi-rocm/bin/ompi_info | grep -i slurm)" ]
+
 # Set OpenMPI env variables
 ENV OMPI_MCA_pml=ucx
 ENV OMPI_MCA_osc=ucx
@@ -177,6 +201,20 @@ RUN git clone ${FA_REPO} flash-attention && \
     git checkout ${FA_BRANCH} && \
     git submodule update --init && \
     MAX_JOBS=${MAX_JOBS} GPU_ARCHS=${PYTORCH_ROCM_ARCH} python3 setup.py bdist_wheel --dist-dir=dist
+
+# Clone and build aiter
+FROM base AS build_aiter
+ARG AITER_BRANCH
+ARG AITER_REPO
+RUN --mount=type=bind,from=build_pytorch,src=/app/install/,target=/install \
+    pip install /install/*.whl
+RUN git clone --recursive ${AITER_REPO}
+RUN cd aiter \
+    && git checkout ${AITER_BRANCH} \
+    && git submodule update --init --recursive \
+    && pip install -r requirements.txt
+RUN pip install pyyaml && cd aiter && PREBUILD_KERNELS=1 GPU_ARCHS=gfx942 python3 setup.py bdist_wheel --dist-dir=dist && ls /app/aiter/dist/*.whl
+RUN mkdir -p /app/install && cp /app/aiter/dist/*.whl /app/install
 
 # Copy all wheel files to installation directory
 RUN cp /pytorch/pytorch/dist/*.whl /app/install && \
