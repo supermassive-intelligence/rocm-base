@@ -1,17 +1,22 @@
 ###############################################################################
 # AMD BASE IMAGE
-FROM rocm/dev-ubuntu-22.04:6.3.1-complete AS amd
+FROM rocm/dev-ubuntu-22.04:6.4.1-complete AS amd
 ARG PYTORCH_ROCM_ARCH=gfx90a;gfx942
 ENV PYTORCH_ROCM_ARCH=${PYTORCH_ROCM_ARCH}
 ARG PYTHON_VERSION=3.12
-ARG HIPBLASLT_BRANCH="4d40e36"
+ARG HIPBLASLT_BRANCH="aa0bda7b"
 ARG HIPBLAS_COMMON_BRANCH="7c1566b"
-ARG PYTORCH_BRANCH="3ac5a49"
-ARG PYTORCH_VISION_BRANCH="v0.19.1"
+ARG PYTORCH_BRANCH="295f2ed4"
+ARG PYTORCH_VISION_BRANCH="v0.21.0"
 ARG PYTORCH_REPO="https://github.com/pytorch/pytorch.git"
 ARG PYTORCH_VISION_REPO="https://github.com/pytorch/vision.git"
-ARG FA_BRANCH="b7d29fb"
+ARG FA_BRANCH="1a7f4dfa"
 ARG FA_REPO="https://github.com/ROCm/flash-attention.git"
+ARG AITER_BRANCH="6b92d30d"
+ARG AITER_REPO="https://github.com/ROCm/aiter.git"
+
+ARG SLURM_VERSION=23.11.1
+ARG PMIX_VERSION=5.0.8
 
 ARG TRITON_BRANCH="e5be006"
 ARG TRITON_REPO="https://github.com/triton-lang/triton.git"
@@ -21,10 +26,12 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN mkdir -p /app
 WORKDIR /app
 
-# Install Python and other dependencies
 RUN apt-get update -y \
-    && apt-get install -y software-properties-common git curl sudo vim less \
-    && add-apt-repository ppa:deadsnakes/ppa \
+    && apt-get install -y software-properties-common git curl sudo vim less libgfortran5 \
+    && for i in 1 2 3; do \
+        add-apt-repository -y ppa:deadsnakes/ppa && break || \
+        { echo "Attempt $i failed, retrying in 5s..."; sleep 5; }; \
+    done \
     && apt-get update -y \
     && apt-get install -y python${PYTHON_VERSION} python${PYTHON_VERSION}-dev python${PYTHON_VERSION}-venv \
        python${PYTHON_VERSION}-lib2to3 python-is-python3  \
@@ -34,9 +41,7 @@ RUN apt-get update -y \
     && curl -sS https://bootstrap.pypa.io/get-pip.py | python${PYTHON_VERSION} \
     && python3 --version && python3 -m pip --version \
     && pip install uv \
-    && pip install -U packaging cmake ninja wheel setuptools pybind11 Cython \
-    && apt-get update && apt-get install -y git && apt-get install -y wget && apt-get install -y cmake  && apt-get install -y python3.10-venv \
-    && apt-get update && apt-get install -y openmpi-bin libopenmpi-dev 
+    && pip install -U packaging 'cmake<4' ninja wheel setuptools pybind11 Cython
 
 RUN mkdir -p /app/install
 
@@ -46,33 +51,24 @@ RUN git clone https://github.com/ROCm/hipBLAS-common.git \
     && mkdir build \
     && cd build \
     && cmake .. \
+    && sed -i 's/set(CPACK_DEBIAN_PACKAGE_RELEASE "[a-f0-9]\{7\}")/set(CPACK_DEBIAN_PACKAGE_RELEASE "83~22.04")/' CPackConfig.cmake \
+    && sed -i 's/set(CPACK_PACKAGE_VERSION "1.0.0")/set(CPACK_PACKAGE_VERSION "1.0.0.60401")/' CPackConfig.cmake \
     && make package \
     && dpkg -i ./*.deb
 
 
-# Install CMake 3.26.2 temporarily
-RUN mkdir -p /opt/cmake && \
-    wget -O - https://github.com/Kitware/CMake/releases/download/v3.26.2/cmake-3.26.2-linux-x86_64.tar.gz | \
-    tar -xvzf - --strip-components=1 -C /opt/cmake && \
-    ln -sf /opt/cmake/bin/cmake /usr/local/bin/cmake
-
-RUN git clone https://github.com/ROCm/hipBLASLt \
-    && cd hipBLASLt \
+RUN git clone https://github.com/ROCm/hipBLASLt
+RUN cd hipBLASLt \
     && git checkout ${HIPBLASLT_BRANCH} \
-    && ./install.sh -d --architecture ${PYTORCH_ROCM_ARCH} \
+    && apt-get install -y llvm-dev \
+    && ./install.sh -dc --architecture ${PYTORCH_ROCM_ARCH} ${LEGACY_HIPBLASLT_OPTION} \
     && cd build/release \
-    && make package -j${MAX_JOBS} \
-    && echo "Searching for build and .deb files:" \
-    && find . -type d -name "build" \
-    && find . -name "*.deb"
+    && make package
+RUN mkdir -p /app/install && cp /app/hipBLASLt/build/release/*.deb /app/hipBLAS-common/build/*.deb /app/install
 
 RUN cp /app/hipBLASLt/build/release/*.deb /app/hipBLAS-common/build/*.deb /app/install
 
-# Uninstall CMake
-RUN rm -rf /opt/cmake && rm -f /usr/local/bin/cmake
-# Reinstall latest Cmake
-RUN apt-get update && apt-get install -y cmake
-
+ENV MAX_JOBS=64
 RUN git clone ${TRITON_REPO}
 RUN cd triton \
     && git checkout ${TRITON_BRANCH} \
@@ -80,6 +76,10 @@ RUN cd triton \
     && python3 setup.py bdist_wheel --dist-dir=dist && \
     pip install dist/*.whl
 RUN cp /app/triton/python/dist/*.whl /app/install
+
+RUN cd /opt/rocm/share/amd_smi \
+    && pip wheel . --wheel-dir=dist
+RUN mkdir -p /app/install && cp /opt/rocm/share/amd_smi/dist/*.whl /app/install
 
 # Set working directory
 WORKDIR /pytorch
@@ -98,7 +98,7 @@ ENV MPI_INCLUDE_DIR=$MPI_HOME/include
 ENV MPI_LIBRARY=$MPI_HOME/lib/libmpi.so
 
 # Clone and build UCX
-RUN apt-get update && apt-get install -y autoconf
+RUN apt-get update -y && apt-get install -y autoconf libtool
 RUN git clone https://github.com/openucx/ucx.git -b v1.15.x && \
     cd ucx && \
     ./autogen.sh && \
@@ -107,15 +107,30 @@ RUN git clone https://github.com/openucx/ucx.git -b v1.15.x && \
       --enable-mt && \
     make -j$(nproc) && make install
 
+# Download and build PMIx
+RUN apt-get update -y && apt-get install -y libevent-dev libhwloc-dev 
+ENV PMIX_DIR=/opt/pmix
+RUN wget https://github.com/openpmix/openpmix/releases/download/v${PMIX_VERSION}/pmix-${PMIX_VERSION}.tar.gz && \
+    tar -xzf pmix-${PMIX_VERSION}.tar.gz && \
+    cd pmix-${PMIX_VERSION} && \
+    ./configure --prefix=${PMIX_DIR} \
+                --enable-shared \
+                --disable-static && \
+    make -j$(nproc) && \
+    make install
+
+ENV PATH="${PMIX_DIR}/bin:${PATH}"
+ENV LD_LIBRARY_PATH="${PMIX_DIR}/lib:${LD_LIBRARY_PATH}"
+ENV PKG_CONFIG_PATH="${PMIX_DIR}/lib/pkgconfig:${PKG_CONFIG_PATH}"
+
 # Download and build Slurm with system PMIx support
-RUN apt-get update && apt-get install -y libpam0g-dev libnuma-dev libhwloc-dev libpmix-dev libpmix2 libmunge-dev munge
-ARG SLURM_VERSION=23.11.1
+RUN apt-get update && apt-get install -y libpam0g-dev libnuma-dev libhwloc-dev libmunge-dev munge
 RUN wget https://download.schedmd.com/slurm/slurm-${SLURM_VERSION}.tar.bz2 && \
     tar -xjf slurm-${SLURM_VERSION}.tar.bz2 && \
     cd slurm-${SLURM_VERSION} && \
-    PKG_CONFIG_PATH="/usr/lib/x86_64-linux-gnu/pkgconfig" \
-    CPPFLAGS="-I/usr/lib/x86_64-linux-gnu/pmix2/include" \
-    LDFLAGS="-L/lib/x86_64-linux-gnu" \
+    PKG_CONFIG_PATH="${PMIX_DIR}/lib/pkgconfig" \
+    CPPFLAGS="-I${PMIX_DIR}/include" \
+    LDFLAGS="-L${PMIX_DIR}/lib" \
     ./configure \
         --prefix=/usr/local \
         --sysconfdir=/etc/slurm \
@@ -138,21 +153,20 @@ RUN cd / && \
         --with-ucx=/opt/ucx-rocm \
         --with-rocm=$ROCM_PATH \
         --with-slurm \
-	--with-pmix-libdir=/lib/x86_64-linux-gnu \
-	--with-pmix-headers=/usr/lib/x86_64-linux-gnu/pmix2/include \
+	--with-pmix-libdir=$PMIX_DIR/lib \
+	--with-pmix-headers=$PMIX_DIR/include \
         --enable-orterun-prefix-by-default && \
       make -j$(nproc) && make install
 
 # Verify Slurm support was built
-RUN [ ! -z "$(/opt/ompi-rocm/bin/ompi_info | grep -i slurm)" ] 
- 
+RUN [ ! -z "$(/opt/ompi-rocm/bin/ompi_info | grep -i slurm)" ]
+
 # Set OpenMPI env variables
 ENV OMPI_MCA_pml=ucx
 ENV OMPI_MCA_osc=ucx
 ENV OMPI_MCA_coll_ucc_enable=1
 ENV OMPI_MCA_coll_ucc_priority=100
 ENV UCX_TLS=sm,self,rocm
-
 
 # Clone and build PyTorch
 RUN git clone ${PYTORCH_REPO} pytorch && \
@@ -176,7 +190,18 @@ RUN git clone ${FA_REPO} flash-attention && \
     cd flash-attention && \
     git checkout ${FA_BRANCH} && \
     git submodule update --init && \
-    MAX_JOBS=${MAX_JOBS} GPU_ARCHS=${PYTORCH_ROCM_ARCH} python3 setup.py bdist_wheel --dist-dir=dist
+    MAX_JOBS=$(nproc) GPU_ARCHS=${PYTORCH_ROCM_ARCH} python3 setup.py bdist_wheel --dist-dir=dist
+
+WORKDIR /app
+
+# Clone and build aiter
+RUN git clone --recursive ${AITER_REPO}
+RUN cd aiter \
+    && git checkout ${AITER_BRANCH} \
+    && git submodule update --init --recursive \
+    && pip install -r requirements.txt
+RUN pip install pyyaml && cd aiter && PREBUILD_KERNELS=1 GPU_ARCHS=gfx942 python3 setup.py bdist_wheel --dist-dir=dist && ls /app/aiter/dist/*.whl
+RUN mkdir -p /app/install && cp /app/aiter/dist/*.whl /app/install
 
 # Copy all wheel files to installation directory
 RUN cp /pytorch/pytorch/dist/*.whl /app/install && \
@@ -197,3 +222,4 @@ ENV PATH="/app/venv/bin:$PATH"
 RUN pip install /app/install/*.whl
 
 #############################################################################
+
