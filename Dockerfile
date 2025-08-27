@@ -6,7 +6,7 @@ ENV PYTORCH_ROCM_ARCH=${PYTORCH_ROCM_ARCH}
 ARG PYTHON_VERSION=3.12
 ARG HIPBLASLT_BRANCH="aa0bda7b"
 ARG HIPBLAS_COMMON_BRANCH="7c1566b"
-ARG PYTORCH_BRANCH="f717b2af"
+ARG PYTORCH_BRANCH="295f2ed4"
 ARG PYTORCH_VISION_BRANCH="v0.21.0"
 ARG PYTORCH_REPO="https://github.com/pytorch/pytorch.git"
 ARG PYTORCH_VISION_REPO="https://github.com/pytorch/vision.git"
@@ -26,10 +26,12 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN mkdir -p /app
 WORKDIR /app
 
-# Install Python and other dependencies
 RUN apt-get update -y \
-    && apt-get install -y software-properties-common git curl sudo vim less \
-    && add-apt-repository ppa:deadsnakes/ppa \
+    && apt-get install -y software-properties-common git curl sudo vim less libgfortran5 \
+    && for i in 1 2 3; do \
+        add-apt-repository -y ppa:deadsnakes/ppa && break || \
+        { echo "Attempt $i failed, retrying in 5s..."; sleep 5; }; \
+    done \
     && apt-get update -y \
     && apt-get install -y python${PYTHON_VERSION} python${PYTHON_VERSION}-dev python${PYTHON_VERSION}-venv \
        python${PYTHON_VERSION}-lib2to3 python-is-python3  \
@@ -39,9 +41,7 @@ RUN apt-get update -y \
     && curl -sS https://bootstrap.pypa.io/get-pip.py | python${PYTHON_VERSION} \
     && python3 --version && python3 -m pip --version \
     && pip install uv \
-    && pip install -U packaging cmake ninja wheel setuptools pybind11 Cython \
-    && apt-get update && apt-get install -y git && apt-get install -y wget && apt-get install -y cmake  && apt-get install -y python3.10-venv \
-    && apt-get update && apt-get install -y openmpi-bin libopenmpi-dev
+    && pip install -U packaging 'cmake<4' ninja wheel setuptools pybind11 Cython
 
 RUN mkdir -p /app/install
 
@@ -51,33 +51,24 @@ RUN git clone https://github.com/ROCm/hipBLAS-common.git \
     && mkdir build \
     && cd build \
     && cmake .. \
+    && sed -i 's/set(CPACK_DEBIAN_PACKAGE_RELEASE "[a-f0-9]\{7\}")/set(CPACK_DEBIAN_PACKAGE_RELEASE "83~22.04")/' CPackConfig.cmake \
+    && sed -i 's/set(CPACK_PACKAGE_VERSION "1.0.0")/set(CPACK_PACKAGE_VERSION "1.0.0.60401")/' CPackConfig.cmake \
     && make package \
     && dpkg -i ./*.deb
 
 
-# Install CMake 3.26.2 temporarily
-RUN mkdir -p /opt/cmake && \
-    wget -O - https://github.com/Kitware/CMake/releases/download/v3.26.2/cmake-3.26.2-linux-x86_64.tar.gz | \
-    tar -xvzf - --strip-components=1 -C /opt/cmake && \
-    ln -sf /opt/cmake/bin/cmake /usr/local/bin/cmake
-
-RUN git clone https://github.com/ROCm/hipBLASLt \
-    && cd hipBLASLt \
+RUN git clone https://github.com/ROCm/hipBLASLt
+RUN cd hipBLASLt \
     && git checkout ${HIPBLASLT_BRANCH} \
-    && ./install.sh -d --architecture ${PYTORCH_ROCM_ARCH} \
+    && apt-get install -y llvm-dev \
+    && ./install.sh -dc --architecture ${PYTORCH_ROCM_ARCH} ${LEGACY_HIPBLASLT_OPTION} \
     && cd build/release \
-    && make package -j${MAX_JOBS} \
-    && echo "Searching for build and .deb files:" \
-    && find . -type d -name "build" \
-    && find . -name "*.deb"
+    && make package
+RUN mkdir -p /app/install && cp /app/hipBLASLt/build/release/*.deb /app/hipBLAS-common/build/*.deb /app/install
 
 RUN cp /app/hipBLASLt/build/release/*.deb /app/hipBLAS-common/build/*.deb /app/install
 
-# Uninstall CMake
-RUN rm -rf /opt/cmake && rm -f /usr/local/bin/cmake
-# Reinstall latest Cmake
-RUN apt-get update && apt-get install -y cmake
-
+ENV MAX_JOBS=64
 RUN git clone ${TRITON_REPO}
 RUN cd triton \
     && git checkout ${TRITON_BRANCH} \
@@ -86,7 +77,6 @@ RUN cd triton \
     pip install dist/*.whl
 RUN cp /app/triton/python/dist/*.whl /app/install
 
-FROM base AS build_amdsmi
 RUN cd /opt/rocm/share/amd_smi \
     && pip wheel . --wheel-dir=dist
 RUN mkdir -p /app/install && cp /opt/rocm/share/amd_smi/dist/*.whl /app/install
@@ -108,7 +98,7 @@ ENV MPI_INCLUDE_DIR=$MPI_HOME/include
 ENV MPI_LIBRARY=$MPI_HOME/lib/libmpi.so
 
 # Clone and build UCX
-RUN apt-get update && apt-get install -y autoconf
+RUN apt-get update -y && apt-get install -y autoconf libtool
 RUN git clone https://github.com/openucx/ucx.git -b v1.15.x && \
     cd ucx && \
     ./autogen.sh && \
@@ -118,6 +108,7 @@ RUN git clone https://github.com/openucx/ucx.git -b v1.15.x && \
     make -j$(nproc) && make install
 
 # Download and build PMIx
+RUN apt-get update -y && apt-get install -y libevent-dev libhwloc-dev 
 ENV PMIX_DIR=/opt/pmix
 RUN wget https://github.com/openpmix/openpmix/releases/download/v${PMIX_VERSION}/pmix-${PMIX_VERSION}.tar.gz && \
     tar -xzf pmix-${PMIX_VERSION}.tar.gz && \
@@ -177,7 +168,6 @@ ENV OMPI_MCA_coll_ucc_enable=1
 ENV OMPI_MCA_coll_ucc_priority=100
 ENV UCX_TLS=sm,self,rocm
 
-
 # Clone and build PyTorch
 RUN git clone ${PYTORCH_REPO} pytorch && \
     cd pytorch && \
@@ -200,14 +190,11 @@ RUN git clone ${FA_REPO} flash-attention && \
     cd flash-attention && \
     git checkout ${FA_BRANCH} && \
     git submodule update --init && \
-    MAX_JOBS=${MAX_JOBS} GPU_ARCHS=${PYTORCH_ROCM_ARCH} python3 setup.py bdist_wheel --dist-dir=dist
+    MAX_JOBS=$(nproc) GPU_ARCHS=${PYTORCH_ROCM_ARCH} python3 setup.py bdist_wheel --dist-dir=dist
+
+WORKDIR /app
 
 # Clone and build aiter
-FROM base AS build_aiter
-ARG AITER_BRANCH
-ARG AITER_REPO
-RUN --mount=type=bind,from=build_pytorch,src=/app/install/,target=/install \
-    pip install /install/*.whl
 RUN git clone --recursive ${AITER_REPO}
 RUN cd aiter \
     && git checkout ${AITER_BRANCH} \
@@ -235,3 +222,4 @@ ENV PATH="/app/venv/bin:$PATH"
 RUN pip install /app/install/*.whl
 
 #############################################################################
+
